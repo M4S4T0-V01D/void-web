@@ -1,0 +1,119 @@
+# Builds and publishes Void Web.
+#  - Every day it checks Mozilla's Maven for a new Firefox engine (GeckoView release channel, which includes
+#    the security dot-releases between the 4-weekly majors). When there is one, it bumps version.properties,
+#    commits that, builds, and publishes a GitHub release. The app's Settings › Updates picks it up.
+#  - A push that changes version.properties (./release.sh) publishes that version.
+#  - "Run workflow" by hand does the engine check, and with "force" rebuilds the current version.
+# Needs the repository secrets KEYSTORE_B64 (base64 of the signing keystore) and KEYSTORE_PASSWORD.
+name: Build and release
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Publish even if this version was already released
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [version.properties]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Look for a new Firefox engine
+        id: engine
+        if: github.event_name != 'push'
+        run: |
+          latest=$(curl -fsSL https://maven.mozilla.org/maven2/org/mozilla/geckoview/geckoview-arm64-v8a/maven-metadata.xml | sed -n 's:.*<release>\(.*\)</release>.*:\1:p')
+          current=$(sed -n 's/^gecko=//p' version.properties)
+          echo "current $current, latest $latest"
+          newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)
+          if [ -z "$latest" ] || [ "$latest" = "$current" ] || [ "$newest" != "$latest" ]; then
+            echo "No new engine."
+            exit 0
+          fi
+          code=$(sed -n 's/^versionCode=//p' version.properties)
+          name=$(sed -n 's/^versionName=//p' version.properties)
+          newname="${name%.*}.$(( ${name##*.} + 1 ))"
+          sed -i "s/^versionCode=.*/versionCode=$((code + 1))/; s/^versionName=.*/versionName=$newname/; s/^gecko=.*/gecko=$latest/" version.properties
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Firefox engine ${latest%.*}"
+          git push
+          echo "notes=New Firefox engine: ${latest%.*} (build ${latest##*.})." >> "$GITHUB_OUTPUT"
+
+      - name: Read the version
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name=$(sed -n 's/^versionName=//p' version.properties)
+          echo "code=$(sed -n 's/^versionCode=//p' version.properties)" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "gecko=$(sed -n 's/^gecko=//p' version.properties)" >> "$GITHUB_OUTPUT"
+          echo "tag=v$name" >> "$GITHUB_OUTPUT"
+          if gh release view "v$name" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "v$name is already released."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.v.outputs.build == 'true'
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Android SDK platform
+        if: steps.v.outputs.build == 'true'
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.2" > /dev/null || true
+
+      - name: Build
+        if: steps.v.outputs.build == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/void-web.jks"
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=voidweb\nkeyPassword=%s\n' "$RUNNER_TEMP/void-web.jks" "$KEYSTORE_PASSWORD" "$KEYSTORE_PASSWORD" > keystore.properties
+          ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk VoidWeb.apk
+          rm keystore.properties "$RUNNER_TEMP/void-web.jks"
+
+      - name: Publish
+        if: steps.v.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ steps.engine.outputs.notes }}
+        run: |
+          notes="${NOTES:-$(git log -1 --format=%s)}"
+          python3 - "$notes" <<'EOF'
+          import hashlib, json, os, sys
+          apk = open("VoidWeb.apk", "rb").read()
+          json.dump({
+              "versionCode": int("${{ steps.v.outputs.code }}"),
+              "versionName": "${{ steps.v.outputs.name }}",
+              "gecko": "${{ steps.v.outputs.gecko }}",
+              "sha256": hashlib.sha256(apk).hexdigest(),
+              "size": len(apk),
+              "notes": sys.argv[1],
+          }, open("latest.json", "w"), indent=2)
+          EOF
+          cat latest.json
+          gh release delete "${{ steps.v.outputs.tag }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "${{ steps.v.outputs.tag }}" VoidWeb.apk latest.json --title "Void Web ${{ steps.v.outputs.name }}" --notes "$notes" --latest
